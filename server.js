@@ -119,34 +119,82 @@ app.post('/api/payfastNotify', async (req, res) => {
       console.log('💰 Payment successful, updating Firestore...');
 
       // Extract challan number from basket ID
-      // Format: CHALLAN-{number}-{timestamp}
+      // Format: CHALLAN-{challan_number}-{timestamp}
+      // Example: CHALLAN-CH-20251124-19981-1764448963246
       const parts = basketId.split('-');
-      const challanNumber = parts[1];
+      
+      // Remove "CHALLAN" (first element) and timestamp (last element)
+      // This handles challan numbers with hyphens like "CH-20251124-19981"
+      const challanNumber = parts.slice(1, -1).join('-');
 
-      console.log('📄 Challan Number:', challanNumber);
+      console.log('📄 Basket ID Parts:', parts);
+      console.log('📄 Extracted Challan Number:', challanNumber);
 
-      if (!challanNumber) {
-        console.error('❌ Could not extract challan number');
-        return res.status(400).json({ error: 'Invalid basket ID format' });
+      if (!challanNumber || challanNumber.length === 0) {
+        console.error('❌ Could not extract challan number from basket ID:', basketId);
+        return res.status(400).json({ 
+          error: 'Invalid basket ID format',
+          basketId: basketId 
+        });
       }
 
       // Find and update challan in Firestore
       const challansRef = db.collection('challans');
+      
+      console.log('🔍 Searching for challan with number:', challanNumber);
+      
       const snapshot = await challansRef
         .where('challanNumber', '==', challanNumber)
         .limit(1)
         .get();
 
+      // Also try searching with challan_no field (alternative field name)
+      if (snapshot.empty) {
+        console.log('⚠️ Not found with "challanNumber", trying "challan_no"...');
+        const snapshot2 = await challansRef
+          .where('challan_no', '==', challanNumber)
+          .limit(1)
+          .get();
+        
+        if (!snapshot2.empty) {
+          const challanDoc = snapshot2.docs[0];
+          console.log('📍 Found challan document with challan_no:', challanDoc.id);
+          
+          await challanDoc.ref.update({
+            status: 'PAID',
+            transactionId: transactionId || 'N/A',
+            basketId: basketId,
+            paymentDate: admin.firestore.FieldValue.serverTimestamp(),
+            paymentMethod: 'PayFast',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+
+          console.log('✅ Challan updated successfully in Firestore');
+          
+          return res.status(200).json({ 
+            success: true,
+            message: 'Payment processed successfully',
+            challanNumber: challanNumber,
+            transactionId: transactionId
+          });
+        }
+      }
+
       if (snapshot.empty) {
         console.error('❌ Challan not found in Firestore');
+        console.error('   Searched for challanNumber:', challanNumber);
+        console.error('   Basket ID was:', basketId);
+        
         return res.status(404).json({ 
           error: 'Challan not found',
-          challanNumber: challanNumber
+          challanNumber: challanNumber,
+          basketId: basketId
         });
       }
 
       const challanDoc = snapshot.docs[0];
       console.log('📍 Found challan document:', challanDoc.id);
+      console.log('📋 Current data:', challanDoc.data());
 
       await challanDoc.ref.update({
         status: 'PAID',
