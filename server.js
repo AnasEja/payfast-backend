@@ -28,7 +28,9 @@ if (!admin.apps.length) {
         projectId: process.env.FIREBASE_PROJECT_ID,
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
         privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n')
-      })
+      }),
+      databaseURL: process.env.FIREBASE_DATABASE_URL || 
+                   `https://${process.env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com`
     });
     console.log('✅ Firebase Admin initialized successfully');
   } catch (error) {
@@ -36,13 +38,15 @@ if (!admin.apps.length) {
   }
 }
 
-const db = admin.firestore();
+// Use Realtime Database instead of Firestore
+const db = admin.database();
 
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
     status: 'OK', 
     message: 'PayFast Backend API is running',
+    database: 'Firebase Realtime Database',
     endpoints: {
       notify: '/api/payfastNotify',
       success: '/api/payfastSuccess',
@@ -66,11 +70,13 @@ app.post('/api/payfastNotify', async (req, res) => {
     const errorCode = data.err_code || data.ERROR_CODE || '000';
     const transactionId = data.transaction_id || data.TRANSACTION_ID;
     const validationHash = data.validation_hash || data.VALIDATION_HASH;
+    const emailAddress = data.email_address || data.EMAIL_ADDRESS || '';
 
     console.log('📦 Extracted Data:');
     console.log('  - Basket ID:', basketId);
     console.log('  - Error Code:', errorCode);
     console.log('  - Transaction ID:', transactionId);
+    console.log('  - Email:', emailAddress);
     console.log('  - Validation Hash:', validationHash);
 
     if (!basketId || !validationHash) {
@@ -116,7 +122,7 @@ app.post('/api/payfastNotify', async (req, res) => {
 
     // Check payment status
     if (errorCode === '000' || errorCode === '00') {
-      console.log('💰 Payment successful, updating Firestore...');
+      console.log('💰 Payment successful, updating Realtime Database...');
 
       // Extract challan number from basket ID
       // Format: CHALLAN-{challan_number}-{timestamp}
@@ -124,7 +130,6 @@ app.post('/api/payfastNotify', async (req, res) => {
       const parts = basketId.split('-');
       
       // Remove "CHALLAN" (first element) and timestamp (last element)
-      // This handles challan numbers with hyphens like "CH-20251124-19981"
       const challanNumber = parts.slice(1, -1).join('-');
 
       console.log('📄 Basket ID Parts:', parts);
@@ -138,74 +143,79 @@ app.post('/api/payfastNotify', async (req, res) => {
         });
       }
 
-      // Find and update challan in Firestore
-      const challansRef = db.collection('challans');
-      
-      console.log('🔍 Searching for challan with number:', challanNumber);
-      
-      const snapshot = await challansRef
-        .where('challanNumber', '==', challanNumber)
-        .limit(1)
-        .get();
+      // Convert email to Firebase path format (replace . with ,)
+      const emailPath = emailAddress.replace(/\./g, ',');
+      console.log('📧 Email path:', emailPath);
 
-      // Also try searching with challan_no field (alternative field name)
-      if (snapshot.empty) {
-        console.log('⚠️ Not found with "challanNumber", trying "challan_no"...');
-        const snapshot2 = await challansRef
-          .where('challan_no', '==', challanNumber)
-          .limit(1)
-          .get();
+      // Update in Realtime Database
+      // Path: challans_metadata/{email}/{challanNumber}
+      const challanRef = db.ref(`challans_metadata/${emailPath}/${challanNumber}`);
+      
+      console.log('🔍 Checking if challan exists...');
+      
+      const snapshot = await challanRef.once('value');
+      
+      if (!snapshot.exists()) {
+        console.error('❌ Challan not found in Realtime Database');
+        console.error('   Path:', `challans_metadata/${emailPath}/${challanNumber}`);
+        console.error('   Email:', emailAddress);
+        console.error('   Challan Number:', challanNumber);
         
-        if (!snapshot2.empty) {
-          const challanDoc = snapshot2.docs[0];
-          console.log('📍 Found challan document with challan_no:', challanDoc.id);
-          
-          await challanDoc.ref.update({
-            status: 'PAID',
-            transactionId: transactionId || 'N/A',
-            basketId: basketId,
-            paymentDate: admin.firestore.FieldValue.serverTimestamp(),
-            paymentMethod: 'PayFast',
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-
-          console.log('✅ Challan updated successfully in Firestore');
-          
-          return res.status(200).json({ 
-            success: true,
-            message: 'Payment processed successfully',
+        // Try to find it in any email path
+        console.log('🔎 Searching all emails for challan...');
+        const allChallansRef = db.ref('challans_metadata');
+        const allSnapshot = await allChallansRef.once('value');
+        
+        let found = false;
+        allSnapshot.forEach((emailSnap) => {
+          const challanSnap = emailSnap.child(challanNumber);
+          if (challanSnap.exists()) {
+            console.log('✅ Found challan under email:', emailSnap.key);
+            found = true;
+            
+            // Update it
+            challanSnap.ref.update({
+              status: 'paid',
+              payment_transaction_id: transactionId || 'N/A',
+              payment_date: Date.now(),
+              payment_method: 'PayFast',
+              basket_id: basketId
+            }).then(() => {
+              console.log('✅ Challan updated successfully');
+            });
+          }
+        });
+        
+        if (!found) {
+          return res.status(404).json({ 
+            error: 'Challan not found in any email path',
             challanNumber: challanNumber,
-            transactionId: transactionId
+            emailPath: emailPath,
+            basketId: basketId
           });
         }
-      }
-
-      if (snapshot.empty) {
-        console.error('❌ Challan not found in Firestore');
-        console.error('   Searched for challanNumber:', challanNumber);
-        console.error('   Basket ID was:', basketId);
         
-        return res.status(404).json({ 
-          error: 'Challan not found',
+        return res.status(200).json({ 
+          success: true,
+          message: 'Payment processed and challan updated',
           challanNumber: challanNumber,
-          basketId: basketId
+          transactionId: transactionId
         });
       }
 
-      const challanDoc = snapshot.docs[0];
-      console.log('📍 Found challan document:', challanDoc.id);
-      console.log('📋 Current data:', challanDoc.data());
+      console.log('📍 Found challan in Realtime Database');
+      console.log('📋 Current data:', snapshot.val());
 
-      await challanDoc.ref.update({
-        status: 'PAID',
-        transactionId: transactionId || 'N/A',
-        basketId: basketId,
-        paymentDate: admin.firestore.FieldValue.serverTimestamp(),
-        paymentMethod: 'PayFast',
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      // Update the challan
+      await challanRef.update({
+        status: 'paid',
+        payment_transaction_id: transactionId || 'N/A',
+        payment_date: Date.now(),
+        payment_method: 'PayFast',
+        basket_id: basketId
       });
 
-      console.log('✅ Challan updated successfully in Firestore');
+      console.log('✅ Challan updated successfully in Realtime Database');
 
       return res.status(200).json({ 
         success: true,
@@ -288,4 +298,5 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📍 Health check: http://localhost:${PORT}/`);
+  console.log(`💾 Using Firebase Realtime Database`);
 });
